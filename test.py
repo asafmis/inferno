@@ -19,9 +19,7 @@ import re
 import time
 from collections import Counter
  
-from fastapi import FastAPI, HTTPException, Response
-from prometheus_client import (CONTENT_TYPE_LATEST, Gauge, Histogram,
-                               Counter as PromCounter, generate_latest)
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
  
 # ---------------------------------------------------------------------------
@@ -101,16 +99,59 @@ def synthesize_completion(target_tokens: int, prompt_id: int, rng: random.Random
  
  
 # ---------------------------------------------------------------------------
-# 4. METRICS -- same names vLLM exposes, so stock dashboards work unchanged.
+# 4. METRICS -- the same things vLLM tracks (a per-request timing histogram
+#    for each stage, live gauges, cumulative counters), but /metrics reports
+#    plain readable summary stats. There is no scraper here, just a human
+#    reading the response, so we skip Prometheus's text exposition format
+#    entirely.
 # ---------------------------------------------------------------------------
-running = Gauge("vllm:num_requests_running", "Requests running on GPU")
-waiting = Gauge("vllm:num_requests_waiting", "Requests queued")
-kv_usage = Gauge("vllm:kv_cache_usage_perc", "Fraction of KV blocks in use")
-ttft = Histogram("vllm:time_to_first_token_seconds", "TTFT",
-                 buckets=[.01, .05, .1, .25, .5, 1, 2.5, 5, 10])
-e2e = Histogram("vllm:e2e_request_latency_seconds", "End-to-end latency")
-ptoks = PromCounter("vllm:prompt_tokens_total", "Prefill tokens processed")
-gtoks = PromCounter("vllm:generation_tokens_total", "Generation tokens produced")
+class Histogram:
+    """Records raw observations, in seconds, and reports summary stats."""
+
+    def __init__(self, description: str):
+        self.description = description
+        self._values: list[float] = []
+
+    def observe(self, seconds: float) -> None:
+        self._values.append(seconds)
+
+    def summary(self) -> dict:
+        if not self._values:
+            return {"description": self.description, "count": 0}
+        values = sorted(self._values)
+        n = len(values)
+
+        def percentile(p: float) -> float:
+            return round(values[min(n - 1, int(p * n))], 4)
+
+        return {
+            "description": self.description,
+            "count": n,
+            "avg": round(sum(values) / n, 4),
+            "min": round(values[0], 4),
+            "p50": percentile(0.50),
+            "p90": percentile(0.90),
+            "p99": percentile(0.99),
+            "max": round(values[-1], 4),
+        }
+
+
+ttft = Histogram("time to first token: arrival -> first generated token")
+tpot = Histogram("time per output token: (e2e - ttft) / completion_tokens")
+itl = Histogram("inter-token latency: duration of each individual decode step")
+e2e = Histogram("end-to-end latency: arrival -> final token")
+queue_time = Histogram("time spent WAITING for a batch slot")
+prefill_time = Histogram("time spent in PREFILL")
+decode_time = Histogram("time spent in DECODE")
+inference_time = Histogram("time spent RUNNING: prefill + decode")
+
+_state = {
+    "requests_running": 0,
+    "requests_waiting": 0,
+    "kv_cache_usage_percent": 0.0,
+    "prompt_tokens_total": 0,
+    "generation_tokens_total": 0,
+}
  
 # ---------------------------------------------------------------------------
 # 5. THE SIMULATION
@@ -128,58 +169,69 @@ async def simulate_inference(prompt: str, prompt_id: int) -> dict:
     # Real engines hold requests in a waiting queue until a batch slot and
     # enough KV-cache blocks are free. The semaphore reproduces the queueing
     # delay that dominates tail latency under load.
-    waiting.inc()
+    _state["requests_waiting"] += 1
     async with _slots:
-        waiting.dec()
-        running.inc()
+        _state["requests_waiting"] -= 1
+        _state["requests_running"] += 1
         queue_ms = (time.perf_counter() - t0) * 1000
- 
+
         # ---- STAGE 1: TOKENIZATION ---------------------------------------
         # CPU-side, text -> token IDs. We approximate the count only; the
         # tokenizer's output length is all the timing model needs.
         prompt_tokens = estimate_tokens(prompt)
         await asyncio.sleep(len(prompt) / 1000 * TOKENIZE_MS_PER_KCHAR / 1000)
- 
+
         # Materialise the output now so the token count that drives the decode
         # timing is exactly the count we report back to the caller.
         text = synthesize_completion(sample_output_length(rng), prompt_id, rng)
         completion_tokens = estimate_tokens(text)
- 
+
         _kv_used += prompt_tokens + completion_tokens
-        kv_usage.set(min(1.0, _kv_used / KV_CACHE_TOKENS))
- 
+        _state["kv_cache_usage_percent"] = round(min(1.0, _kv_used / KV_CACHE_TOKENS) * 100, 2)
+
         # ---- STAGE 2: PREFILL --------------------------------------------
         # One parallel forward pass over the whole prompt. Compute-bound, so
         # cost scales LINEARLY WITH PROMPT LENGTH. Fills the KV cache and
         # emits the first token -- this is what determines TTFT.
+        prefill_t0 = time.perf_counter()
         await asyncio.sleep(prompt_tokens * PREFILL_MS_PER_TOKEN / 1000)
+        prefill_ms = (time.perf_counter() - prefill_t0) * 1000
         ttft_ms = (time.perf_counter() - t0) * 1000
- 
+
         # ---- STAGE 3: DECODE ---------------------------------------------
         # Autoregressive loop, one token per iteration. Memory-bandwidth-bound:
         # every step re-reads all model weights, so per-token cost is roughly
         # CONSTANT and INDEPENDENT OF PROMPT LENGTH -- that is what the KV
-        # cache buys us. Jitter models sampling and scheduler variance.
+        # cache buys us. Each step's own duration is the inter-token latency.
+        decode_t0 = time.perf_counter()
         for _ in range(completion_tokens):
+            step_t0 = time.perf_counter()
             await asyncio.sleep(DECODE_MS_PER_TOKEN * random.uniform(0.9, 1.15) / 1000)
- 
+            itl.observe(time.perf_counter() - step_t0)
+        decode_ms = (time.perf_counter() - decode_t0) * 1000
+
         # ---- STAGE 4: DETOKENIZATION -------------------------------------
         # Token IDs -> text, CPU-side. When streaming this runs per token and
         # must buffer partial UTF-8 sequences.
         await asyncio.sleep(completion_tokens * DETOKENIZE_MS_PER_TOK / 1000)
- 
+
         # ---- STAGE 5: TEARDOWN -------------------------------------------
         # Free the KV blocks and release the slot, letting the scheduler admit
         # the next queued request.
         _kv_used -= prompt_tokens + completion_tokens
-        kv_usage.set(min(1.0, _kv_used / KV_CACHE_TOKENS))
-        running.dec()
- 
+        _state["kv_cache_usage_percent"] = round(min(1.0, _kv_used / KV_CACHE_TOKENS) * 100, 2)
+        _state["requests_running"] -= 1
+
     total_ms = (time.perf_counter() - t0) * 1000
     ttft.observe(ttft_ms / 1000)
+    tpot.observe((total_ms - ttft_ms) / completion_tokens / 1000)
     e2e.observe(total_ms / 1000)
-    ptoks.inc(prompt_tokens)
-    gtoks.inc(completion_tokens)
+    queue_time.observe(queue_ms / 1000)
+    prefill_time.observe(prefill_ms / 1000)
+    decode_time.observe(decode_ms / 1000)
+    inference_time.observe((prefill_ms + decode_ms) / 1000)
+    _state["prompt_tokens_total"] += prompt_tokens
+    _state["generation_tokens_total"] += completion_tokens
  
     return {
         "content": text,
@@ -207,7 +259,23 @@ class GenerateRequest(BaseModel):
  
 @app.get("/metrics")
 async def metrics():
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return {
+        "requests_running": _state["requests_running"],
+        "requests_waiting": _state["requests_waiting"],
+        "kv_cache_usage_percent": _state["kv_cache_usage_percent"],
+        "prompt_tokens_total": _state["prompt_tokens_total"],
+        "generation_tokens_total": _state["generation_tokens_total"],
+        "latency_seconds": {
+            "time_to_first_token": ttft.summary(),
+            "time_per_output_token": tpot.summary(),
+            "inter_token_latency": itl.summary(),
+            "e2e_request_latency": e2e.summary(),
+            "request_queue_time": queue_time.summary(),
+            "request_prefill_time": prefill_time.summary(),
+            "request_decode_time": decode_time.summary(),
+            "request_inference_time": inference_time.summary(),
+        },
+    }
  
  
 @app.post("/generate")
