@@ -1,2 +1,11 @@
+# dataset
 kagglehub
 pandas
+
+# ground-truth tokenizer, for scripts/estimate_tokens.py
+tiktoken
+
+# the mock server (app.py)
+fastapi
+uvicorn
+prometheus_client
